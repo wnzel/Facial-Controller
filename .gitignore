@@ -1,0 +1,11 @@
+﻿# build/cache
+__pycache__/
+*.pyc
+
+# big local assets (don’t push)
+face_landmarker_v2_with_blendshapes.task
+wheels/
+python-*-embed-amd64/
+*.zip
+*.7z
+*.exe

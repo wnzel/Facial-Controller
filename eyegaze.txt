@@ -1,0 +1,314 @@
+# facial_gba.py — Gaze D-Pad with MENU ASSIST (pulse) for 2x2 choice grids (mGBA)
+#
+# D-Pad (gaze): LEFT/RIGHT/UP/DOWN
+#   • NORMAL mode: short glance=tap, sustained=hold (for walking)
+#   • MENU mode (toggle by holding mouth open ~0.6s): gaze sends controlled TAP PULSES
+#       -> perfect for FIGHT/BAG/PKMN/RUN; no overshoot, tiny eye moves work
+#
+# A (tap)  = “teeth-frown” (press/upper lip/cheek press is OK)
+# B (tap)  = mouth open (quick)
+#
+# Toggle MENU mode = long mouth-open (>= MENU_TOGGLE_HOLD)
+#
+# Map keys in mGBA: D-Pad = arrows; A=Z, B=X (or edit TAP_KEYS/HOLD_KEYS below)
+
+import os, time, ctypes
+import cv2, pyautogui, mediapipe as mp
+from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+
+# -------- keyboard ----------
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.02
+TAP_DOWN_MS = 60
+
+# -------- always-on-top (Windows) ----------
+HWND_TOPMOST, SWP_NOSIZE, SWP_NOMOVE = -1, 0x0001, 0x0002
+user32 = ctypes.windll.user32
+def atop(title: str):
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+
+# =================== CONFIG ===================
+MODEL_PATH  = "face_landmarker_v2_with_blendshapes.task"
+CAM_INDEX   = 0
+VIEW_TITLE  = "Facial Controller (Gaze + MENU)"
+FPS_TARGET  = 30
+
+# keys
+HOLD_KEYS = {"UP":"up","DOWN":"down","LEFT":"left","RIGHT":"right"}
+TAP_KEYS  = {"A":"z","B":"x"}
+
+# smoothing (EMA)
+EMA_ALPHA = 0.5
+def ema(prev, x, a=EMA_ALPHA): return x if prev is None else (a*x + (1-a)*prev)
+
+# ------- gaze sensitivity (easy) -------
+AUTO_GAIN          = True
+PEAK_DECAY         = 0.996
+ON_FRAC, OFF_FRAC  = 0.62, 0.45
+FLOOR_ON, FLOOR_OFF= 0.16, 0.10
+CENTER_DEAD        = 0.06
+BLINK_TH           = 0.40
+
+# Dominance & snap
+DOM_MARGIN   = 0.03
+DOM_RATIO    = 1.10
+SNAP_MIN_MAG = 0.03   # min vector length before snapping to a quadrant
+
+# tap/hold timing (NORMAL mode)
+HOLD_MIN   = 0.18
+TAP_MAX    = 0.14
+DEBOUNCE_TAP_SEC = 0.25
+
+# -------- MENU ASSIST (pulse mode) --------
+MENU_TOGGLE_HOLD = 0.60     # hold mouth open this long to toggle mode
+PULSE_PERIOD     = 0.22     # seconds between repeated taps while gazing
+PULSE_DEAD_TIME  = 0.12     # after a tap, brief lockout per direction
+
+# -------- A/B detectors --------
+AFROWN_ON_TH    = 0.20
+AFROWN_OFF_TH   = 0.13
+AFROWN_MIN_SEC  = 0.12
+SMILE_BLOCK_TH  = 0.25
+OPEN_BLOCK_TH   = 0.30
+MOUTH_OPEN_TH   = 0.50
+
+def tap(k: str):
+    pyautogui.keyDown(k); time.sleep(TAP_DOWN_MS/1000.0); pyautogui.keyUp(k)
+
+def get_bs(name, face_blendshapes):
+    if not face_blendshapes: return 0.0
+    first = face_blendshapes[0]
+    categories = getattr(first, "categories", None) or first
+    for cat in categories:
+        if getattr(cat, "category_name", None) == name:
+            return float(getattr(cat, "score", 0.0))
+    return 0.0
+
+def make_landmarker():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Missing model: {MODEL_PATH}\nPlace it next to this script."
+        )
+    opts = FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=RunningMode.VIDEO,
+        num_faces=1,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=False,
+    )
+    return FaceLandmarker.create_from_options(opts)
+
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam."); return
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+
+    try:
+        lm = make_landmarker()
+    except FileNotFoundError as e:
+        print(str(e)); return
+
+    # runtime state
+    held = {"UP":False,"DOWN":False,"LEFT":False,"RIGHT":False}
+    g_start = {"LEFT":None,"RIGHT":None,"UP":None,"DOWN":None}
+    current = None
+    last_tap = 0.0
+
+    # MENU mode
+    menu_mode = False
+    last_pulse = {"LEFT":0.0,"RIGHT":0.0,"UP":0.0,"DOWN":0.0}
+    dir_dead   = {"LEFT":0.0,"RIGHT":0.0,"UP":0.0,"DOWN":0.0}
+    open_hold_start = None
+
+    # A arming
+    af_armed = False; af_arm_t = 0.0
+
+    # smoothed signals + peaks
+    s = {k:None for k in ["blinkL","blinkR","open","smile","afrown","gL","gR","gU","gD"]}
+    peak = {"LEFT":0.01,"RIGHT":0.01,"UP":0.01,"DOWN":0.01}
+
+    print("Running. Q/ESC to quit.")
+    while True:
+        ok, bgr = cap.read()
+        if not ok: continue
+
+        # --- MediaPipe forward ---
+        try:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGBA,
+                              data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA))
+            res = lm.detect_for_video(mp_img, int(time.time()*1000))
+            bs = res.face_blendshapes if (res and res.face_blendshapes) else None
+        except Exception:
+            bs = None
+
+        # ---- blendshapes ----
+        li = get_bs("eyeLookInLeft",   bs); lo = get_bs("eyeLookOutLeft",  bs)
+        ri = get_bs("eyeLookInRight",  bs); ro = get_bs("eyeLookOutRight", bs)
+        lu = get_bs("eyeLookUpLeft",   bs); ld = get_bs("eyeLookDownLeft", bs)
+        ru = get_bs("eyeLookUpRight",  bs); rd = get_bs("eyeLookDownRight",bs)
+        blinkL = get_bs("eyeBlinkLeft",  bs); blinkR = get_bs("eyeBlinkRight", bs)
+
+        mouthOpen = get_bs("mouthOpen", bs)
+        smile     = 0.5*(get_bs("mouthSmileLeft", bs) + get_bs("mouthSmileRight", bs))
+        frown     = 0.5*(get_bs("mouthFrownLeft", bs) + get_bs("mouthFrownRight", bs))
+        press     = 0.5*(get_bs("mouthPressLeft",  bs) + get_bs("mouthPressRight",  bs))
+        upper     = 0.5*(get_bs("mouthUpperUpLeft", bs) + get_bs("mouthUpperUpRight", bs))
+        sneer     = 0.5*(get_bs("noseSneerLeft", bs) + get_bs("noseSneerRight", bs))
+        afrown_raw= max(frown, 0.7*press + 0.3*upper, 0.6*sneer)
+
+        # gaze raw
+        gL_raw = 0.5*(lo + ri)
+        gR_raw = 0.5*(li + ro)
+        gU_raw = 0.5*(lu + ru)
+        gD_raw = 0.5*(ld + rd)
+
+        # smooth
+        s["gL"] = ema(s["gL"], gL_raw); s["gR"] = ema(s["gR"], gR_raw)
+        s["gU"] = ema(s["gU"], gU_raw); s["gD"] = ema(s["gD"], gD_raw)
+        s["blinkL"] = ema(s["blinkL"], blinkL); s["blinkR"] = ema(s["blinkR"], blinkR)
+        s["open"]   = ema(s["open"],   mouthOpen); s["smile"]  = ema(s["smile"],  smile)
+        s["afrown"] = ema(s["afrown"], afrown_raw)
+
+        # auto-gain
+        if AUTO_GAIN:
+            for d, val in {"LEFT":s["gL"],"RIGHT":s["gR"],"UP":s["gU"],"DOWN":s["gD"]}.items():
+                v = val or 0.0
+                peak[d] = max(peak[d]*PEAK_DECAY, v)
+            dyn_on  = {d: max(FLOOR_ON,  ON_FRAC  * peak[d]) for d in peak}
+            dyn_off = {d: max(FLOOR_OFF, OFF_FRAC * peak[d]) for d in peak}
+        else:
+            dyn_on  = {d: 0.24 for d in ("LEFT","RIGHT","UP","DOWN")}
+            dyn_off = {d: 0.16 for d in ("LEFT","RIGHT","UP","DOWN")}
+
+        now = time.time()
+
+        # ===== MENU toggle via long mouth-open =====
+        if (s["open"] or 0.0) > MOUTH_OPEN_TH:
+            if open_hold_start is None: open_hold_start = now
+        else:
+            if open_hold_start is not None and (now - open_hold_start) >= MENU_TOGGLE_HOLD:
+                menu_mode = not menu_mode
+                # release any holds when switching to MENU
+                if menu_mode and any(held.values()):
+                    for d in list(HOLD_KEYS.keys()):
+                        if held[d]:
+                            pyautogui.keyUp(HOLD_KEYS[d]); held[d]=False
+                    current=None; g_start={k:None for k in g_start}
+            open_hold_start = None
+
+        # ===== DPAD (NORMAL or MENU) =====
+        blinking = (s["blinkL"] or 0.0) > BLINK_TH or (s["blinkR"] or 0.0) > BLINK_TH
+        scores = {"LEFT":s["gL"] or 0.0, "RIGHT":s["gR"] or 0.0, "UP":s["gU"] or 0.0, "DOWN":s["gD"] or 0.0}
+
+        # quadrant snap (helps tiny movements)
+        gx = scores["RIGHT"] - scores["LEFT"]
+        gy = scores["UP"]    - scores["DOWN"]
+        mag = (gx*gx + gy*gy) ** 0.5
+
+        # determine best direction
+        best = max(scores, key=scores.get); best_val = scores[best]
+        second_val = sorted(scores.values(), reverse=True)[1]
+        margin_ok = (best_val - second_val) >= DOM_MARGIN
+        ratio_ok  = (second_val == 0) or (best_val/second_val >= 1.10)
+
+        # In MENU mode we prefer snap if vector has any length
+        def directional_candidate():
+            if mag >= SNAP_MIN_MAG:
+                if abs(gx) >= abs(gy):
+                    return "RIGHT" if gx >= 0 else "LEFT"
+                else:
+                    return "UP" if gy >= 0 else "DOWN"
+            return best if (margin_ok or ratio_ok) else None
+
+        cand = None if blinking else directional_candidate()
+
+        if menu_mode:
+            # Pulse taps along cand with rate limit
+            if cand and best_val >= dyn_on[cand] and (now - dir_dead[cand]) >= PULSE_DEAD_TIME:
+                if (now - last_pulse[cand]) >= PULSE_PERIOD:
+                    tap(HOLD_KEYS[cand]); last_pulse[cand] = now
+            # no holds in menu mode
+            if current:
+                pyautogui.keyUp(HOLD_KEYS[current]); held[current]=False; current=None
+            for d in g_start: g_start[d]=None
+        else:
+            # NORMAL mode: tap or hold
+            if cand and best_val >= dyn_on[cand] and (margin_ok or ratio_ok):
+                # start/continue candidate
+                for d in g_start:
+                    if d != cand: g_start[d] = None
+                if current and current != cand:
+                    if held[current]:
+                        pyautogui.keyUp(HOLD_KEYS[current]); held[current]=False
+                    current=None
+                if g_start[cand] is None:
+                    g_start[cand]=now
+            else:
+                for d, t0 in list(g_start.items()):
+                    if t0 is not None:
+                        dur = now - t0
+                        g_start[d] = None
+                        if dur <= TAP_MAX and (now - last_tap) > DEBOUNCE_TAP_SEC:
+                            tap(HOLD_KEYS[d]); last_tap = now
+
+            # promote to hold
+            for d, t0 in g_start.items():
+                if t0 is not None and (now - t0) >= HOLD_MIN and current is None:
+                    pyautogui.keyDown(HOLD_KEYS[d]); held[d]=True; current=d
+                    break
+
+            # release hold if not dominant or below off
+            if current:
+                cur_val = scores[current]
+                best2 = max(scores, key=scores.get)
+                best2_val = scores[best2]
+                sec2_val = sorted(scores.values(), reverse=True)[1]
+                dom_ok = (best2==current) and ((best2_val-sec2_val)>=DOM_MARGIN or (sec2_val==0) or (best2_val/sec2_val>=DOM_RATIO))
+                if cur_val < dyn_off[current] or not dom_ok or blinking:
+                    pyautogui.keyUp(HOLD_KEYS[current]); held[current]=False; current=None
+                    for d in g_start: g_start[d]=None
+
+        # ===== A (teeth-frown) tap on release =====
+        af = s["afrown"] or 0.0
+        can_arm = (s["smile"] or 0.0) < SMILE_BLOCK_TH and (s["open"] or 0.0) < OPEN_BLOCK_TH
+        if can_arm and af >= AFROWN_ON_TH and not af_armed:
+            af_arm_t = now; af_armed = True
+        if af_armed and af < AFROWN_OFF_TH:
+            if (now - af_arm_t) >= AFROWN_MIN_SEC and (now - last_tap) > DEBOUNCE_TAP_SEC:
+                tap(TAP_KEYS["A"]); last_tap = now
+            af_armed = False
+
+        # ===== B (mouth open quick) =====
+        if (s["open"] or 0.0) > MOUTH_OPEN_TH and open_hold_start is None:
+            # quick open = B
+            tap(TAP_KEYS["B"])
+
+        # ---------- HUD ----------
+        cv2.namedWindow(VIEW_TITLE, cv2.WINDOW_NORMAL)
+        hud = bgr.copy()
+        on_str  = f"ON L/R/U/D {max(FLOOR_ON,ON_FRAC*peak['LEFT']):.2f}/{max(FLOOR_ON,ON_FRAC*peak['RIGHT']):.2f}/{max(FLOOR_ON,ON_FRAC*peak['UP']):.2f}/{max(FLOOR_ON,ON_FRAC*peak['DOWN']):.2f}"
+        off_str = f"OFF L/R/U/D {max(FLOOR_OFF,OFF_FRAC*peak['LEFT']):.2f}/{max(FLOOR_OFF,OFF_FRAC*peak['RIGHT']):.2f}/{max(FLOOR_OFF,OFF_FRAC*peak['UP']):.2f}/{max(FLOOR_OFF,OFF_FRAC*peak['DOWN']):.2f}"
+        header = (f"L {scores['LEFT']:.2f} R {scores['RIGHT']:.2f} U {scores['UP']:.2f} D {scores['DOWN']:.2f} "
+                  f"| blinkL {s['blinkL'] or 0:.2f} blinkR {s['blinkR'] or 0:.2f} open {s['open'] or 0:.2f} "
+                  f"| {on_str} | {off_str} | MODE: {'MENU' if menu_mode else 'NORMAL'}")
+        cv2.putText(hud, header, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255,255,255), 2)
+        flags = [k for k,v in held.items() if v]
+        cv2.putText(hud, "HOLD: "+(",".join(flags) if flags else "-"),
+                    (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0,215,255), 2)
+        atop(VIEW_TITLE)
+        cv2.imshow(VIEW_TITLE, hud)
+
+        k = cv2.waitKey(1) & 0xFF
+        if k in (ord('q'), 27): break
+
+    # cleanup
+    for v in HOLD_KEYS.values():
+        try: pyautogui.keyUp(v)
+        except: pass
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

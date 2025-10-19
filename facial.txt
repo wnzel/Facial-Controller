@@ -1,0 +1,313 @@
+# facial_gba.py — Facial gestures -> Keyboard (mGBA-friendly)
+# Mappings:
+#   LEFT  = half-smile (left corner)   -> tap/hold
+#   RIGHT = half-smile (right corner)  -> tap/hold
+#   UP    = brows up (both)            -> hold
+#   DOWN  = big symmetric smile        -> hold
+#   A     = "teeth-frown"              -> tap (on release)
+#   B     = mouth open                 -> tap
+#
+# Tips:
+# - In mGBA, map arrows to D-Pad and Z/X to A/B (or edit TAP_KEYS/HOLD_KEYS).
+# - Window is always-on-top so you can see the HUD while playing.
+
+import os, time, ctypes
+import cv2, pyautogui, mediapipe as mp
+from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+
+# ---------------- pyautogui (keyboard) ----------------
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.02
+TAP_DOWN_MS = 60  # ms key-down for a "tap"
+
+# ---------------- always-on-top (Windows) -------------
+HWND_TOPMOST, SWP_NOSIZE, SWP_NOMOVE = -1, 0x0001, 0x0002
+user32 = ctypes.windll.user32
+def atop(title: str):
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+
+# ===================== CONFIG =========================
+MODEL_PATH  = "face_landmarker_v2_with_blendshapes.task"
+CAM_INDEX   = 0
+VIEW_TITLE  = "Facial Controller"
+FPS_TARGET  = 30
+
+# ---- smoothing ----
+EMA_ALPHA = 0.5
+def ema(prev, x, a=EMA_ALPHA): return x if prev is None else (a*x + (1-a)*prev)
+
+# ---- keyboard bindings ----
+HOLD_KEYS = {"UP":"up","DOWN":"down","LEFT":"left","RIGHT":"right"}
+TAP_KEYS  = {"A":"z","B":"x"}
+
+# ---- tap/hold timing ----
+DEBOUNCE_TAP_SEC = 0.30
+HOLD_MIN   = 0.20   # >= this => becomes hold
+TAP_MAX    = 0.14   # <= this => counted as a quick tap
+
+# ---- HALF-SMILE thresholds (per side) ----
+# base (static) thresholds; may be overridden by Auto-Sense below
+L_SMILE_ON      = 0.30
+L_SMILE_OFF     = 0.20
+R_SMILE_ON      = 0.30
+R_SMILE_OFF     = 0.20
+SMILE_ASYM_MIN  = 0.08      # left must exceed right by this (or vice versa)
+SMILE_BLOCK_FOR_DOWN = 0.62 # if overall smile exceeds this, treat as DOWN not side
+
+# ---- UP / DOWN holds ----
+BROW_ON_TH     = 0.55  # brows up to start UP
+BROW_OFF_TH    = 0.40  # release UP
+SMILE_HOLD_TH  = 0.60  # symmetric big smile -> DOWN hold
+
+# ---- A (teeth-frown) tap on release ----
+AFROWN_ON_TH    = 0.22
+AFROWN_OFF_TH   = 0.15
+AFROWN_MIN_SEC  = 0.14
+AFROWN_COOLDOWN = 0.30
+SMILE_BLOCK_TH  = 0.25  # don't arm A if smiling
+OPEN_BLOCK_TH   = 0.30  # don't arm A if mouth open
+
+# ---- B (mouth open) ----
+MOUTH_OPEN_TH   = 0.55
+
+# ---- optional auto-sensitivity (learns comfortable levels) ----
+AUTO_SENSE = True
+AUTO_DECAY = 0.995            # slow decay so peaks can drift down gently
+L_ON_FRAC, L_OFF_FRAC = 0.70, 0.50
+R_ON_FRAC, R_OFF_FRAC = 0.70, 0.50
+L_FLOOR_ON, L_FLOOR_OFF = 0.24, 0.16
+R_FLOOR_ON, R_FLOOR_OFF = 0.24, 0.16
+# =====================================================
+
+def tap(k: str):
+    pyautogui.keyDown(k); time.sleep(TAP_DOWN_MS/1000.0); pyautogui.keyUp(k)
+
+def get_bs(name, face_blendshapes):
+    """Robustly fetch a blendshape by name across mediapipe versions."""
+    if not face_blendshapes:
+        return 0.0
+    first = face_blendshapes[0]
+    categories = getattr(first, "categories", None) or first
+    for cat in categories:
+        if getattr(cat, "category_name", None) == name:
+            return float(getattr(cat, "score", 0.0))
+    return 0.0
+
+def make_landmarker():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Missing model: {MODEL_PATH}\nPlace it next to this script."
+        )
+    opts = FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=RunningMode.VIDEO,
+        num_faces=1,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=False,
+    )
+    return FaceLandmarker.create_from_options(opts)
+
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam."); return
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+
+    try:
+        landmarker = make_landmarker()
+    except FileNotFoundError as e:
+        print(str(e)); return
+
+    # -------- runtime state --------
+    held = {"UP":False,"DOWN":False,"LEFT":False,"RIGHT":False}
+    lt_start = rt_start = None          # timers for left/right half-smiles
+    af_armed = False; af_arm_t = 0.0    # A (teeth-frown) arm/release
+    last_tap = 0.0
+    sent_msg, sent_t = "", 0.0
+
+    # smoothed signals
+    s = {k:None for k in [
+        "mouthOpen","smile","brow","afrown",
+        "smileL","smileR","lHalf","rHalf"
+    ]}
+
+    # peaks for auto-sensitivity
+    auto_l_peak = 0.01
+    auto_r_peak = 0.01
+
+    print("Running. Q/ESC to quit.")
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            continue
+
+        # ---- run MediaPipe ----
+        try:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGBA,
+                              data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA))
+            res = landmarker.detect_for_video(mp_img, int(time.time()*1000))
+            bs = res.face_blendshapes if (res and res.face_blendshapes) else None
+        except Exception:
+            bs = None
+
+        # ---- raw blendshapes ----
+        mouthOpen = get_bs("mouthOpen", bs)
+
+        smileL    = get_bs("mouthSmileLeft",  bs)
+        smileR    = get_bs("mouthSmileRight", bs)
+        dimpleL   = get_bs("mouthDimpleLeft", bs)
+        dimpleR   = get_bs("mouthDimpleRight", bs)
+        pressL    = get_bs("mouthPressLeft",  bs)
+        pressR    = get_bs("mouthPressRight", bs)
+
+        browUpIn  = get_bs("browInnerUp", bs)
+        browUpOL  = get_bs("browOuterUpLeft",  bs)
+        browUpOR  = get_bs("browOuterUpRight", bs)
+
+        frown     = 0.5*(get_bs("mouthFrownLeft", bs) + get_bs("mouthFrownRight", bs))
+        pressAvg  = 0.5*(pressL + pressR)
+        upper     = 0.5*(get_bs("mouthUpperUpLeft", bs) + get_bs("mouthUpperUpRight", bs))
+        sneer     = 0.5*(get_bs("noseSneerLeft", bs) + get_bs("noseSneerRight", bs))
+
+        # ---- composed signals ----
+        # Half-smile per side: corner lift; optionally reinforced by dimple/press
+        lHalf_raw = max(smileL, 0.6*dimpleL + 0.4*pressL)
+        rHalf_raw = max(smileR, 0.6*dimpleR + 0.4*pressR)
+
+        smile_avg = 0.5*(smileL + smileR)
+        brow_up   = max(browUpIn, 0.5*(browUpOL + browUpOR))
+        afrown_raw= max(frown, 0.7*pressAvg + 0.3*upper, 0.6*sneer)
+
+        # ---- smooth ----
+        s["mouthOpen"] = ema(s["mouthOpen"], mouthOpen)
+        s["smile"]     = ema(s["smile"],     smile_avg)
+        s["brow"]      = ema(s["brow"],      brow_up)
+        s["afrown"]    = ema(s["afrown"],    afrown_raw)
+        s["smileL"]    = ema(s["smileL"],    smileL)
+        s["smileR"]    = ema(s["smileR"],    smileR)
+        s["lHalf"]     = ema(s["lHalf"],     lHalf_raw)
+        s["rHalf"]     = ema(s["rHalf"],     rHalf_raw)
+
+        # ---- optional auto-sensitivity (adapts thresholds to the user) ----
+        if AUTO_SENSE:
+            auto_l_peak = max(auto_l_peak * AUTO_DECAY, s["lHalf"] or 0.0)
+            auto_r_peak = max(auto_r_peak * AUTO_DECAY, s["rHalf"] or 0.0)
+            dyn_L_ON  = max(L_FLOOR_ON,  L_ON_FRAC  * auto_l_peak)
+            dyn_L_OFF = max(L_FLOOR_OFF, L_OFF_FRAC * auto_l_peak)
+            dyn_R_ON  = max(R_FLOOR_ON,  R_ON_FRAC  * auto_r_peak)
+            dyn_R_OFF = max(R_FLOOR_OFF, R_OFF_FRAC * auto_r_peak)
+        else:
+            dyn_L_ON, dyn_L_OFF = L_SMILE_ON, L_SMILE_OFF
+            dyn_R_ON, dyn_R_OFF = R_SMILE_ON, R_SMILE_OFF
+
+        now = time.time()
+
+        # ---------------- LEFT via left half-smile (tap/hold w/ asymmetry & block) --
+        l_val = s["lHalf"] or 0.0
+        asymL_ok = ((s["smileL"] or 0.0) - (s["smileR"] or 0.0)) >= SMILE_ASYM_MIN
+        if l_val >= dyn_L_ON and asymL_ok and (s["smile"] or 0.0) < SMILE_BLOCK_FOR_DOWN:
+            if lt_start is None: lt_start = now
+        else:
+            if lt_start is not None and l_val < dyn_L_OFF:
+                dur = now - lt_start
+                lt_start = None
+                if dur >= HOLD_MIN:
+                    if held["LEFT"]: pyautogui.keyUp(HOLD_KEYS["LEFT"]); held["LEFT"] = False
+                elif dur <= TAP_MAX and (now - last_tap) > DEBOUNCE_TAP_SEC:
+                    tap(HOLD_KEYS["LEFT"]); last_tap = now
+                    sent_msg, sent_t = "LEFT (half-smile tap)", now
+
+        if lt_start and (now - lt_start) >= HOLD_MIN and not held["LEFT"]:
+            if held["RIGHT"]: pyautogui.keyUp(HOLD_KEYS["RIGHT"]); held["RIGHT"] = False
+            pyautogui.keyDown(HOLD_KEYS["LEFT"]); held["LEFT"] = True
+            sent_msg, sent_t = "LEFT (half-smile HOLD)", now
+
+        # ---------------- RIGHT via right half-smile (tap/hold & asymmetry) ---------
+        r_val = s["rHalf"] or 0.0
+        asymR_ok = ((s["smileR"] or 0.0) - (s["smileL"] or 0.0)) >= SMILE_ASYM_MIN
+        if r_val >= dyn_R_ON and asymR_ok and (s["smile"] or 0.0) < SMILE_BLOCK_FOR_DOWN:
+            if rt_start is None: rt_start = now
+        else:
+            if rt_start is not None and r_val < dyn_R_OFF:
+                dur = now - rt_start
+                rt_start = None
+                if dur >= HOLD_MIN:
+                    if held["RIGHT"]: pyautogui.keyUp(HOLD_KEYS["RIGHT"]); held["RIGHT"] = False
+                elif dur <= TAP_MAX and (now - last_tap) > DEBOUNCE_TAP_SEC:
+                    tap(HOLD_KEYS["RIGHT"]); last_tap = now
+                    sent_msg, sent_t = "RIGHT (half-smile tap)", now
+
+        if rt_start and (now - rt_start) >= HOLD_MIN and not held["RIGHT"]:
+            if held["LEFT"]: pyautogui.keyUp(HOLD_KEYS["LEFT"]); held["LEFT"] = False
+            pyautogui.keyDown(HOLD_KEYS["RIGHT"]); held["RIGHT"] = True
+            sent_msg, sent_t = "RIGHT (half-smile HOLD)", now
+
+        # ---------------- A: teeth-frown (tap on release) ----------------------------
+        af = s["afrown"] or 0.0
+        can_arm_af = (s["smile"] or 0.0) < SMILE_BLOCK_TH and (s["mouthOpen"] or 0.0) < OPEN_BLOCK_TH
+        if can_arm_af and af >= AFROWN_ON_TH and not af_armed:
+            af_arm_t = now; af_armed = True
+        if af_armed and (af < AFROWN_OFF_TH):
+            if (now - af_arm_t) >= AFROWN_MIN_SEC and (now - last_tap) > DEBOUNCE_TAP_SEC:
+                tap(TAP_KEYS["A"]); last_tap = now
+                sent_msg, sent_t = "A (teeth-frown)", now
+            af_armed = False
+
+        # ---------------- B: mouth open (tap) ----------------------------------------
+        if (s["mouthOpen"] or 0.0) > MOUTH_OPEN_TH and (now - last_tap) > DEBOUNCE_TAP_SEC:
+            tap(TAP_KEYS["B"]); last_tap = now
+            sent_msg, sent_t = "B (mouth open)", now
+
+        # ---------------- UP/DOWN holds ---------------------------------------------
+        if not held["UP"]:
+            if (s["brow"] or 0.0) > BROW_ON_TH:
+                pyautogui.keyDown(HOLD_KEYS["UP"]); held["UP"] = True
+                sent_msg, sent_t = "UP (brows HOLD)", now
+        else:
+            if (s["brow"] or 0.0) < BROW_OFF_TH:
+                pyautogui.keyUp(HOLD_KEYS["UP"]); held["UP"] = False
+
+        if (s["smile"] or 0.0) > SMILE_HOLD_TH:
+            if not held["DOWN"]:
+                pyautogui.keyDown(HOLD_KEYS["DOWN"]); held["DOWN"] = True
+                sent_msg, sent_t = "DOWN (smile HOLD)", now
+        else:
+            if held["DOWN"]:
+                pyautogui.keyUp(HOLD_KEYS["DOWN"]); held["DOWN"] = False
+
+        # ---------------- HUD --------------------------------------------------------
+        cv2.namedWindow(VIEW_TITLE, cv2.WINDOW_NORMAL)
+        hud = bgr.copy()
+        header = (
+            f"open {s['mouthOpen'] or 0:.2f}  "
+            f"smile {s['smile'] or 0:.2f}  "
+            f"lHalf {s['lHalf'] or 0:.2f}  "
+            f"rHalf {s['rHalf'] or 0:.2f}  "
+            f"afrn {s['afrown'] or 0:.2f}  "
+            f"brow {s['brow'] or 0:.2f}"
+        )
+        if AUTO_SENSE:
+            header += (f"  | L[{(dyn_L_ON):.2f}/{(dyn_L_OFF):.2f}]"
+                       f" R[{(dyn_R_ON):.2f}/{(dyn_R_OFF):.2f}]")
+        cv2.putText(hud, header, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 2)
+        flags = [k for k,v in held.items() if v]
+        cv2.putText(hud, "HOLD: "+(",".join(flags) if flags else "-"),
+                    (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0,215,255), 2)
+        if time.time() - sent_t < 0.9 and sent_msg:
+            cv2.putText(hud, f"SENT: {sent_msg}", (10, 72),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0,255,0), 2)
+        atop(VIEW_TITLE)
+        cv2.imshow(VIEW_TITLE, hud)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27): break
+
+    for v in HOLD_KEYS.values():
+        try: pyautogui.keyUp(v)
+        except: pass
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
